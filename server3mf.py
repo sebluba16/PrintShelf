@@ -4,7 +4,7 @@
 Usage: python3 server3mf.py [DOSSIER_3MF] [--port 8000] [--host 0.0.0.0]
 Sans dépendance externe (stdlib uniquement).
 """
-import argparse, json, mimetypes, os, re, sqlite3, threading, zipfile
+import argparse, hashlib, json, os, re, shutil, sqlite3, threading, uuid, zipfile
 from http.server import ThreadingHTTPServer, BaseHTTPRequestHandler
 from urllib.parse import urlparse, parse_qs, unquote
 
@@ -29,6 +29,17 @@ def init_db():
             id INTEGER PRIMARY KEY, path TEXT UNIQUE, name TEXT, size INTEGER,
             mtime REAL, thumb BLOB, description TEXT DEFAULT '', tags TEXT DEFAULT '');
         """)
+        cols = [r["name"] for r in c.execute("PRAGMA table_info(files)")]
+        if "sha256" not in cols:
+            c.execute("ALTER TABLE files ADD COLUMN sha256 TEXT")
+
+
+def sha256_file(path):
+    h = hashlib.sha256()
+    with open(path, "rb") as f:
+        while chunk := f.read(1 << 20):
+            h.update(chunk)
+    return h.hexdigest()
 
 
 def extract_thumb(path):
@@ -58,16 +69,17 @@ def scan():
                 rel = os.path.relpath(full, ROOT)
                 found.add(rel)
                 st = os.stat(full)
-                row = c.execute("SELECT id,mtime,size FROM files WHERE path=?", (rel,)).fetchone()
-                if row and row["mtime"] == st.st_mtime and row["size"] == st.st_size:
+                row = c.execute("SELECT id,mtime,size,sha256 FROM files WHERE path=?", (rel,)).fetchone()
+                if row and row["mtime"] == st.st_mtime and row["size"] == st.st_size and row["sha256"]:
                     continue
                 th = extract_thumb(full)
+                sh = sha256_file(full)
                 if row:
-                    c.execute("UPDATE files SET name=?,size=?,mtime=?,thumb=? WHERE id=?",
-                              (f, st.st_size, st.st_mtime, th, row["id"]))
+                    c.execute("UPDATE files SET name=?,size=?,mtime=?,thumb=?,sha256=? WHERE id=?",
+                              (f, st.st_size, st.st_mtime, th, sh, row["id"]))
                 else:
-                    c.execute("INSERT INTO files(path,name,size,mtime,thumb) VALUES(?,?,?,?,?)",
-                              (rel, f, st.st_size, st.st_mtime, th))
+                    c.execute("INSERT INTO files(path,name,size,mtime,thumb,sha256) VALUES(?,?,?,?,?,?)",
+                              (rel, f, st.st_size, st.st_mtime, th, sh))
         for r in c.execute("SELECT id,path FROM files").fetchall():
             if r["path"] not in found:
                 c.execute("DELETE FROM files WHERE id=?", (r["id"],))
@@ -157,11 +169,50 @@ class H(BaseHTTPRequestHandler):
             return
         self.send(404, "not found", "text/plain")
 
+    def upload(self):
+        """POST /api/upload : corps = fichier brut, nom dans l'en-tête X-Filename."""
+        name = os.path.basename(unquote(self.headers.get("X-Filename", "")).replace("\\", "/"))
+        name = re.sub(r"[^\w.\- ()\[\]]", "_", name).strip()
+        if not name.lower().endswith(".3mf"):
+            return self.send(400, {"error": "fichier .3mf requis"})
+        n = int(self.headers.get("Content-Length", 0))
+        updir = os.path.join(ROOT, "uploads")
+        os.makedirs(updir, exist_ok=True)
+        tmp = os.path.join(updir, ".tmp-" + uuid.uuid4().hex)
+        h = hashlib.sha256()
+        with open(tmp, "wb") as f:
+            left = n
+            while left > 0:
+                chunk = self.rfile.read(min(1 << 16, left))
+                if not chunk:
+                    break
+                h.update(chunk)
+                f.write(chunk)
+                left -= len(chunk)
+        if left > 0 or not zipfile.is_zipfile(tmp):
+            os.remove(tmp)
+            return self.send(400, {"error": "fichier incomplet ou invalide"})
+        with LOCK, db() as c:
+            dup = c.execute("SELECT name,path FROM files WHERE sha256=?", (h.hexdigest(),)).fetchone()
+        if dup:
+            os.remove(tmp)
+            return self.send(200, {"status": "duplicate", "name": dup["name"]})
+        base, ext = os.path.splitext(name)
+        dest, i = os.path.join(updir, name), 1
+        while os.path.exists(dest):
+            dest = os.path.join(updir, "%s (%d)%s" % (base, i, ext))
+            i += 1
+        shutil.move(tmp, dest)
+        scan()
+        self.send(200, {"status": "added", "name": os.path.basename(dest)})
+
     def do_HEAD(self):
         self.do_GET()
 
     def do_POST(self):
         p = urlparse(self.path).path
+        if p == "/api/upload":
+            return self.upload()
         n = int(self.headers.get("Content-Length", 0))
         data = json.loads(self.rfile.read(n) or b"{}")
         if p == "/api/rescan":
@@ -209,8 +260,9 @@ a.btn{display:inline-block;text-decoration:none;background:var(--acc);color:#fff
 a.btn.sec{background:#2a303a}
 </style></head><body>
 <header><h1>📦 3MF</h1><input id="q" placeholder="Rechercher (nom, tag, description)…">
-<button id="scan">Réindexer</button><span class="mut" id="cnt"></span></header>
+<button class="pri" id="imp">⬆ Importer depuis ce PC</button><button id="scan">Réindexer</button><span class="mut" id="cnt"></span></header>
 <div id="tags"></div><div id="grid"></div>
+<input type="file" id="picker" webkitdirectory multiple hidden>
 <div id="modal"><div class="box" id="box"></div></div>
 <script>
 let files=[],tag="",cur=null;
@@ -245,6 +297,35 @@ function open(id){
     close();load()};
 }
 function close(){$('#modal').classList.remove('on')}
+$('#imp').onclick=()=>{$('#picker').value='';$('#picker').click()};
+$('#picker').onchange=()=>{
+  const list=[...$('#picker').files].filter(f=>f.name.toLowerCase().endsWith('.3mf'))
+    .sort((a,b)=>(a.webkitRelativePath||a.name).localeCompare(b.webkitRelativePath||b.name));
+  if(!list.length){alert('Aucun fichier .3mf dans ce dossier.');return}
+  $('#box').innerHTML=`<div class="f" style="grid-column:1/-1"><b>Importer ${list.length} fichier(s) 3MF vers la bibliothèque</b>
+   <div class="row"><button id="all">Tout cocher</button><button id="none">Tout décocher</button><span class="mut" id="sel"></span></div>
+   <div id="ilist" style="max-height:55vh;overflow:auto;display:flex;flex-direction:column;gap:4px">
+   ${list.map((f,i)=>`<label class="row" style="align-items:center;gap:8px"><input type="checkbox" data-i="${i}" checked>
+     <span style="flex:1;word-break:break-all">${esc(f.webkitRelativePath||f.name)}</span>
+     <span class="mut">${(f.size/1048576).toFixed(1)} Mo</span><span class="mut" id="st${i}"></span></label>`).join('')}</div>
+   <div class="row"><button class="pri" id="go">Transférer la sélection</button><button id="close">Fermer</button></div></div>`;
+  $('#modal').classList.add('on');$('#close').onclick=()=>{close();load()};
+  const boxes=()=>[...document.querySelectorAll('#ilist input')];
+  const upd=()=>$('#sel').textContent=boxes().filter(b=>b.checked).length+' sélectionné(s)';
+  $('#ilist').onchange=upd;upd();
+  $('#all').onclick=()=>{boxes().forEach(b=>b.checked=true);upd()};
+  $('#none').onclick=()=>{boxes().forEach(b=>b.checked=false);upd()};
+  $('#go').onclick=async()=>{
+    $('#go').disabled=true;
+    for(const b of boxes().filter(b=>b.checked)){
+      const i=+b.dataset.i,st=$('#st'+i);b.disabled=true;st.textContent='⏳';
+      try{const r=await fetch('/api/upload',{method:'POST',headers:{'X-Filename':encodeURIComponent(list[i].name)},body:list[i]});
+        const j=await r.json();st.textContent=j.status==='added'?'✅ ajouté':j.status==='duplicate'?'↩ déjà présent':'❌ '+(j.error||'erreur')}
+      catch(e){st.textContent='❌ réseau'}
+    }
+    $('#go').textContent='Terminé';
+  };
+};
 $('#modal').onclick=e=>{if(e.target.id==='modal')close()};
 document.onkeydown=e=>{if(e.key==='Escape')close()};
 load();

@@ -27,6 +27,16 @@ Options :
 
 Les tags et descriptions sont stockés dans `<dossier>/.library.db`. Le bouton **Réindexer** prend en compte les nouveaux fichiers, sans perdre les tags existants.
 
+## Importer depuis plusieurs PC
+
+Un seul serveur = un seul dépôt. Depuis **n'importe quel PC** :
+
+1. Ouvre PrintShelf dans le navigateur.
+2. Clique sur **⬆ Importer depuis ce PC** et choisis le dossier local contenant des 3MF.
+3. Coche les fichiers à transférer (ou tout cocher / tout décocher), puis **Transférer la sélection**.
+
+Les fichiers arrivent dans `<dossier>/uploads/`. Les doublons (même contenu, même nom ou non) sont détectés et ignorés ; un nom déjà pris reçoit un suffixe `(1)`.
+
 ## Ouvrir dans Bambu Studio
 
 Le bouton utilise le lien `bambustudio://open?file=<url>` : Bambu Studio télécharge le fichier depuis le serveur.
