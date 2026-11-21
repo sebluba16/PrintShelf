@@ -4,7 +4,8 @@
 Usage: python3 server3mf.py [DOSSIER_3MF] [--port 8000] [--host 0.0.0.0]
 Sans dépendance externe (stdlib uniquement).
 """
-import argparse, hashlib, json, os, re, shutil, sqlite3, threading, uuid, zipfile
+import argparse, array, hashlib, json, os, re, shutil, sqlite3, sys, threading, uuid, zipfile
+import xml.etree.ElementTree as ET
 from http.server import ThreadingHTTPServer, BaseHTTPRequestHandler
 from urllib.parse import urlparse, parse_qs, unquote, quote
 
@@ -69,6 +70,119 @@ def extract_thumb(path):
     except Exception:
         pass
     return None
+
+
+# ---------- aperçu 3D : extraction du maillage d'un 3MF ----------
+MAX_MODEL = 64 << 20     # taille max (décompressée) d'un fichier .model lu
+MAX_TRIS = 2_000_000
+MESH_CACHE = {}
+IDENT = [[1, 0, 0, 0], [0, 1, 0, 0], [0, 0, 1, 0], [0, 0, 0, 1]]
+
+
+def ln(tag):
+    return tag.rsplit("}", 1)[-1]
+
+
+def parse_tf(s):
+    if not s:
+        return IDENT
+    f = [float(x) for x in s.split()]
+    if len(f) != 12:
+        raise ValueError("transformation invalide")
+    return [f[0:3] + [0], f[3:6] + [0], f[6:9] + [0], f[9:12] + [1]]
+
+
+def matmul(a, b):  # a appliquée en premier (vecteurs-lignes, convention 3MF)
+    return [[sum(a[i][k] * b[k][j] for k in range(4)) for j in range(4)] for i in range(4)]
+
+
+def load_model(z, name):
+    info = z.getinfo(name)
+    if info.file_size > MAX_MODEL:
+        raise ValueError("modèle trop gros pour l'aperçu 3D")
+    data = z.read(name)
+    if b"<!DOCTYPE" in data[:4096] or b"<!ENTITY" in data[:65536]:
+        raise ValueError("fichier refusé")
+    root = ET.fromstring(data)
+    objs, build = {}, []
+    for sec in root:
+        t = ln(sec.tag)
+        if t == "resources":
+            for o in sec:
+                if ln(o.tag) != "object":
+                    continue
+                mesh = next((m for m in o if ln(m.tag) == "mesh"), None)
+                if mesh is not None:
+                    verts, tris = [], []
+                    for part in mesh:
+                        pt = ln(part.tag)
+                        if pt == "vertices":
+                            verts = [(float(v.get("x")), float(v.get("y")), float(v.get("z"))) for v in part]
+                        elif pt == "triangles":
+                            tris = [(int(q.get("v1")), int(q.get("v2")), int(q.get("v3"))) for q in part]
+                    objs[o.get("id")] = {"mesh": (verts, tris)}
+                else:
+                    comps = []
+                    for cs in o:
+                        if ln(cs.tag) == "components":
+                            for cc in cs:
+                                path = next((v for k, v in cc.attrib.items() if ln(k) == "path"), None)
+                                comps.append((cc.get("objectid"), path, cc.get("transform")))
+                    objs[o.get("id")] = {"components": comps}
+        elif t == "build":
+            build = [(it.get("objectid"), it.get("transform")) for it in sec if ln(it.tag) == "item"]
+    return objs, build
+
+
+def build_mesh(path):
+    """Retourne les triangles du 3MF : float32 little-endian, 9 valeurs par triangle."""
+    with zipfile.ZipFile(path) as z:
+        names = z.namelist()
+        main = next((n for n in names if n.lower() == "3d/3dmodel.model"), None) or \
+            next((n for n in names if n.lower().startswith("3d/") and n.lower().endswith(".model")), None)
+        if not main:
+            raise ValueError("aucun modèle 3D dans ce fichier")
+        models = {}
+
+        def get(name):
+            name = name.lstrip("/")
+            if name not in models:
+                models[name] = load_model(z, name)
+            return models[name]
+
+        out = array.array("f")
+
+        def emit(oid, mname, tf, depth):
+            if depth > 8:
+                raise ValueError("assemblage trop profond")
+            o = get(mname)[0].get(oid)
+            if o is None:
+                return
+            if "mesh" in o:
+                verts, tris = o["mesh"]
+                if len(out) // 9 + len(tris) > MAX_TRIS:
+                    raise ValueError("modèle trop détaillé pour l'aperçu 3D")
+                m = tf
+                tv = [(x * m[0][0] + y * m[1][0] + z_ * m[2][0] + m[3][0],
+                       x * m[0][1] + y * m[1][1] + z_ * m[2][1] + m[3][1],
+                       x * m[0][2] + y * m[1][2] + z_ * m[2][2] + m[3][2]) for x, y, z_ in verts]
+                for a, b, c in tris:
+                    out.extend(tv[a]); out.extend(tv[b]); out.extend(tv[c])
+            else:
+                for cid, cpath, ctf in o["components"]:
+                    emit(cid, cpath.lstrip("/") if cpath else mname, matmul(parse_tf(ctf), tf), depth + 1)
+
+        objs, build = get(main)
+        if build:
+            for oid, tf in build:
+                emit(oid, main, parse_tf(tf), 0)
+        else:
+            for oid, o in objs.items():
+                if "mesh" in o:
+                    emit(oid, main, IDENT, 0)
+    if sys.byteorder == "big":
+        out.byteswap()
+    return out.tobytes()
 
 
 def scan():
@@ -197,6 +311,26 @@ class H(BaseHTTPRequestHandler):
                         if t:
                             cnt[t] = cnt.get(t, 0) + 1
             return self.send(200, sorted(cnt.items()))
+        m = re.match(r"^/api/mesh/(\d+)$", p)
+        if m:
+            with db() as c:
+                r = c.execute("SELECT path,mtime,size FROM files WHERE id=?", (m.group(1),)).fetchone()
+            full = os.path.join(ROOT, r["path"]) if r else ""
+            if not r or not inside_root(full) or not os.path.isfile(full):
+                return self.send(404, {"error": "introuvable"})
+            key = (r["path"], r["mtime"], r["size"])
+            data = MESH_CACHE.get(key)
+            if data is None:
+                try:
+                    data = build_mesh(full)
+                except ValueError as e:
+                    return self.send(422, {"error": str(e)})
+                except Exception:
+                    return self.send(422, {"error": "modèle 3D illisible"})
+                if len(MESH_CACHE) >= 6:
+                    MESH_CACHE.pop(next(iter(MESH_CACHE)))
+                MESH_CACHE[key] = data
+            return self.send(200, data, "application/octet-stream", {"Cache-Control": "private, max-age=300"})
         m = re.match(r"^/thumb/(\d+)$", p)
         if m:
             with db() as c:
@@ -468,6 +602,55 @@ async function load(){
   const tr=await (await fetch('/api/tags')).json();
   $('#tags').innerHTML=tr.map(([t,n])=>`<span class="tag ${t===tag?'on':''}" data-t="${esc(t)}">${esc(t)} (${n})</span>`).join('');
 }
+const M4={
+ mul(a,b){const o=new Float32Array(16);for(let c=0;c<4;c++)for(let r=0;r<4;r++){let s=0;for(let k=0;k<4;k++)s+=a[k*4+r]*b[c*4+k];o[c*4+r]=s}return o},
+ persp(f,asp,n,fa){const t=1/Math.tan(f/2),o=new Float32Array(16);o[0]=t/asp;o[5]=t;o[10]=(fa+n)/(n-fa);o[11]=-1;o[14]=2*fa*n/(n-fa);return o},
+ look(e,c,u){let z=[e[0]-c[0],e[1]-c[1],e[2]-c[2]];const nz=Math.hypot(...z);z=z.map(x=>x/nz);
+  let x=[u[1]*z[2]-u[2]*z[1],u[2]*z[0]-u[0]*z[2],u[0]*z[1]-u[1]*z[0]];const nx=Math.hypot(...x);x=x.map(v=>v/nx);
+  const y=[z[1]*x[2]-z[2]*x[1],z[2]*x[0]-z[0]*x[2],z[0]*x[1]-z[1]*x[0]];
+  return new Float32Array([x[0],y[0],z[0],0,x[1],y[1],z[1],0,x[2],y[2],z[2],0,
+   -(x[0]*e[0]+x[1]*e[1]+x[2]*e[2]),-(y[0]*e[0]+y[1]*e[1]+y[2]*e[2]),-(z[0]*e[0]+z[1]*e[1]+z[2]*e[2]),1])}
+};
+function view3d(cv,buf){
+  const gl=cv.getContext('webgl2');if(!gl)return{err:'WebGL2 indisponible sur ce navigateur'};
+  const v=new Float32Array(buf);if(!v.length)return{err:'modèle vide'};
+  const mn=[1e30,1e30,1e30],mx=[-1e30,-1e30,-1e30];
+  for(let i=0;i<v.length;i+=3)for(let k=0;k<3;k++){const x=v[i+k];if(x<mn[k])mn[k]=x;if(x>mx[k])mx[k]=x}
+  const c=mn.map((m,k)=>(m+mx[k])/2),rad=Math.hypot(mx[0]-mn[0],mx[1]-mn[1],mx[2]-mn[2])/2||1;
+  const sh=(t,src)=>{const s=gl.createShader(t);gl.shaderSource(s,src);gl.compileShader(s);return s};
+  const pr=gl.createProgram();
+  gl.attachShader(pr,sh(gl.VERTEX_SHADER,`#version 300 es
+in vec3 p;uniform mat4 mv,mvp;out vec3 vp;void main(){vp=(mv*vec4(p,1.)).xyz;gl_Position=mvp*vec4(p,1.);}`));
+  gl.attachShader(pr,sh(gl.FRAGMENT_SHADER,`#version 300 es
+precision highp float;in vec3 vp;out vec4 o;void main(){
+vec3 n=normalize(cross(dFdx(vp),dFdy(vp)));float l=abs(dot(n,normalize(vec3(.3,.5,.8))));
+o=vec4(vec3(.0,.68,.26)*(.25+.75*l)+vec3(.12)*pow(l,8.),1.);}`));
+  gl.linkProgram(pr);if(!gl.getProgramParameter(pr,gl.LINK_STATUS))return{err:'shader invalide'};
+  gl.useProgram(pr);
+  const vb=gl.createBuffer();gl.bindBuffer(gl.ARRAY_BUFFER,vb);gl.bufferData(gl.ARRAY_BUFFER,v,gl.STATIC_DRAW);
+  const loc=gl.getAttribLocation(pr,'p');gl.enableVertexAttribArray(loc);gl.vertexAttribPointer(loc,3,gl.FLOAT,false,0,0);
+  gl.enable(gl.DEPTH_TEST);
+  let yaw=-0.8,pitch=0.6,dist=rad*2.6;
+  function draw(){
+    const d=window.devicePixelRatio||1,w=Math.max(1,Math.round(cv.clientWidth*d)),h=Math.max(1,Math.round(cv.clientHeight*d));
+    if(cv.width!==w||cv.height!==h){cv.width=w;cv.height=h}
+    gl.viewport(0,0,w,h);gl.clearColor(.17,.18,.22,1);gl.clear(gl.COLOR_BUFFER_BIT|gl.DEPTH_BUFFER_BIT);
+    const e=[c[0]+dist*Math.cos(pitch)*Math.cos(yaw),c[1]+dist*Math.cos(pitch)*Math.sin(yaw),c[2]+dist*Math.sin(pitch)];
+    const mv=M4.look(e,c,[0,0,1]),pj=M4.persp(0.8,w/h,Math.max(rad*0.02,dist-rad*2),dist+rad*2);
+    gl.uniformMatrix4fv(gl.getUniformLocation(pr,'mv'),false,mv);
+    gl.uniformMatrix4fv(gl.getUniformLocation(pr,'mvp'),false,M4.mul(pj,mv));
+    gl.drawArrays(gl.TRIANGLES,0,v.length/3);
+  }
+  let drag=null;cv.style.touchAction='none';cv.style.cursor='grab';
+  cv.addEventListener('pointerdown',e=>{cv.setPointerCapture(e.pointerId);drag=[e.clientX,e.clientY]});
+  cv.addEventListener('pointerup',()=>drag=null);
+  cv.addEventListener('pointermove',e=>{if(!drag)return;
+    yaw-=(e.clientX-drag[0])*0.01;pitch=Math.max(-1.5,Math.min(1.5,pitch+(e.clientY-drag[1])*0.01));
+    drag=[e.clientX,e.clientY];draw()});
+  cv.addEventListener('wheel',e=>{e.preventDefault();dist=Math.max(rad*0.4,Math.min(rad*12,dist*Math.exp(e.deltaY*0.001)));draw()},{passive:false});
+  draw();
+  return{dims:[0,1,2].map(k=>(mx[k]-mn[k]).toFixed(1)).join(' × ')};
+}
 async function api(url,body){
   const r=await fetch(url,{method:'POST',body:JSON.stringify(body)});
   const j=await r.json().catch(()=>({}));
@@ -500,7 +683,8 @@ function open(id){
   cur=files.find(f=>f.id===id);
   const url=location.origin+'/files/'+cur.id+'/'+encodeURIComponent(cur.name);
   const bs='bambustudio://open?file='+encodeURIComponent(url);
-  $('#box').innerHTML=`<div>${cur.has_thumb?`<img src="/thumb/${cur.id}">`:''}</div>
+  $('#box').innerHTML=`<div id="pv"><div id="pvbox">${cur.has_thumb?`<img src="/thumb/${cur.id}">`:''}</div>
+  <div class="row" style="margin-top:8px;align-items:center"><button id="v3d">🧊 Voir en 3D</button><span class="mut" id="pvmsg"></span></div></div>
   <div class="f"><b>${esc(cur.name)}</b><span class="mut">${esc(cur.path)} · ${(cur.size/1048576).toFixed(2)} Mo</span>
   <div class="row"><a class="btn" href="${bs}">🖨 Ouvrir dans Bambu Studio</a><a class="btn sec" href="${url}">Télécharger</a></div>
   <label>Tags (séparés par des virgules)<input id="etags" style="width:100%" value="${esc(cur.tags.join(', '))}"></label>
@@ -510,6 +694,19 @@ function open(id){
   <div class="row"><button class="pri" id="save">Enregistrer</button><button id="close">Fermer</button><button id="del" style="margin-left:auto">🗑 Supprimer</button></div></div>`;
   $('#modal').classList.add('on');
   $('#close').onclick=close;
+  let on3d=false;
+  $('#v3d').onclick=async()=>{
+    const box=$('#pvbox'),msg=$('#pvmsg');
+    if(on3d){box.innerHTML=cur.has_thumb?`<img src="/thumb/${cur.id}">`:'';$('#v3d').textContent='🧊 Voir en 3D';msg.textContent='';on3d=false;return}
+    msg.textContent='Chargement…';
+    const r=await fetch('/api/mesh/'+cur.id);
+    if(!r.ok){const j=await r.json().catch(()=>({}));msg.textContent=j.error||'Erreur';return}
+    const buf=await r.arrayBuffer();
+    box.innerHTML='<canvas style="width:100%;aspect-ratio:1;background:#2b2f38;border-radius:10px;display:block"></canvas>';
+    const res=view3d(box.firstChild,buf);
+    if(res.err){box.innerHTML=cur.has_thumb?`<img src="/thumb/${cur.id}">`:'';msg.textContent=res.err;return}
+    on3d=true;$('#v3d').textContent='🖼 Image';msg.textContent=res.dims+' mm · glisser : tourner · molette : zoom';
+  };
   $('#del').onclick=async()=>{if(!confirm('Supprimer définitivement "'+cur.name+'" du dépôt ?'))return;
     if(await api('/api/files/'+cur.id+'/delete',{})){close();load()}};
   $('#save').onclick=async()=>{

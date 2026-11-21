@@ -59,6 +59,14 @@ Le bouton utilise le lien `bambustudio://open?file=<url>` : Bambu Studio téléc
 
 Lues dans le 3MF, par ordre de préférence : `Metadata/plate_1.png`, `Metadata/thumbnail.png`, `Metadata/top_1.png`, puis le premier PNG trouvé.
 
+## Visualiseur 3D
+
+Dans la fiche d'un fichier, **🧊 Voir en 3D** affiche le modèle en 3D (rotation à la souris ou au doigt, zoom à la molette) et ses dimensions en mm. **🖼 Image** revient à la miniature.
+
+- Rendu WebGL2 sans bibliothèque externe, fonctionne hors ligne.
+- Lit les 3MF simples et ceux de Bambu Studio (objets externes, assemblages, transformations).
+- Pas de couleurs ni de plateau : forme seule, en vert. Limites : fichier `.model` de 64 Mo max décompressé et 2 millions de triangles.
+
 ## Supprimer un fichier
 
 Dans la fiche : **🗑 Supprimer** (avec confirmation). Le fichier est effacé du disque et de l'index. C'est définitif.
