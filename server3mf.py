@@ -265,6 +265,60 @@ class H(BaseHTTPRequestHandler):
                 return self.send(400, {"error": "nom vide"})
             os.makedirs(os.path.join(ROOT, rel), exist_ok=True)
             return self.send(200, {"ok": True, "path": rel})
+        if p == "/api/folders/rename":
+            try:
+                old = safe_rel(data.get("path", ""))
+                new = safe_rel(data.get("name", ""))
+            except ValueError:
+                return self.send(400, {"error": "nom invalide"})
+            if not old or not new or "/" in new:
+                return self.send(400, {"error": "nom invalide"})
+            parent = os.path.dirname(old)
+            newrel = (parent + "/" if parent else "") + new
+            src, dst = os.path.join(ROOT, old), os.path.join(ROOT, newrel)
+            if not os.path.isdir(src):
+                return self.send(404, {"error": "dossier introuvable"})
+            if os.path.exists(dst):
+                return self.send(409, {"error": "ce nom existe déjà"})
+            pre = old + "/"
+            with LOCK, db() as c:
+                os.rename(src, dst)
+                for r in c.execute("SELECT id,path FROM files WHERE substr(path,1,?)=?", (len(pre), pre)).fetchall():
+                    c.execute("UPDATE files SET path=? WHERE id=?", (newrel + "/" + r["path"][len(pre):], r["id"]))
+            return self.send(200, {"ok": True, "path": newrel})
+        if p == "/api/folders/delete":
+            try:
+                rel = safe_rel(data.get("path", ""))
+            except ValueError:
+                return self.send(400, {"error": "chemin invalide"})
+            target = os.path.join(ROOT, rel)
+            if not rel or not os.path.isdir(target):
+                return self.send(404, {"error": "dossier introuvable"})
+            if any(fs for _, _, fs in os.walk(target)):
+                return self.send(409, {"error": "dossier non vide : déplace d'abord ses fichiers"})
+            shutil.rmtree(target)
+            return self.send(200, {"ok": True})
+        m = re.match(r"^/api/files/(\d+)/rename$", p)
+        if m:
+            name = os.path.basename(str(data.get("name", "")).replace("\\", "/")).strip()
+            name = re.sub(r"[^\w.\- ()\[\]]", "_", name)
+            if not name.lower().endswith(".3mf"):
+                name += ".3mf"
+            if name.lower() == ".3mf":
+                return self.send(400, {"error": "nom invalide"})
+            with LOCK, db() as c:
+                r = c.execute("SELECT path FROM files WHERE id=?", (m.group(1),)).fetchone()
+                if not r:
+                    return self.send(404, {"error": "introuvable"})
+                src = os.path.join(ROOT, r["path"])
+                dst = os.path.join(os.path.dirname(src), name)
+                if dst == src:
+                    return self.send(200, {"ok": True})
+                if os.path.exists(dst):
+                    return self.send(409, {"error": "ce nom existe déjà"})
+                os.rename(src, dst)
+                c.execute("UPDATE files SET path=?,name=? WHERE id=?", (os.path.relpath(dst, ROOT), name, m.group(1)))
+            return self.send(200, {"ok": True})
         m = re.match(r"^/api/files/(\d+)/move$", p)
         if m:
             try:
@@ -334,10 +388,11 @@ a.btn.sec{background:#2a303a}
 #main>section{flex:1;min-width:0}
 .fi{padding:5px 8px;border-radius:8px;cursor:pointer}.fi:hover{background:#2a303a}.fi.on{background:var(--acc)}
 @media(max-width:700px){#main{display:block}aside{width:auto}}
+#fbar{display:none;padding:10px 16px 0;gap:8px;align-items:center}
 </style></head><body>
 <header><h1>📦 3MF</h1><input id="q" placeholder="Rechercher (nom, tag, description)…">
 <button id="nf">📁 Nouveau dossier</button><button class="pri" id="imp">⬆ Importer depuis ce PC</button><button id="scan">Réindexer</button><span class="mut" id="cnt"></span></header>
-<datalist id="fl"></datalist><div id="main"><aside id="tree"></aside><section><div id="tags"></div><div id="grid"></div></section></div>
+<datalist id="fl"></datalist><div id="main"><aside id="tree"></aside><section><div id="fbar"></div><div id="tags"></div><div id="grid"></div></section></div>
 <input type="file" id="picker" webkitdirectory multiple hidden>
 <div id="modal"><div class="box" id="box"></div></div>
 <script>
@@ -353,11 +408,26 @@ async function load(){
   const tr=await (await fetch('/api/tags')).json();
   $('#tags').innerHTML=tr.map(([t,n])=>`<span class="tag ${t===tag?'on':''}" data-t="${esc(t)}">${esc(t)} (${n})</span>`).join('');
 }
+async function api(url,body){
+  const r=await fetch(url,{method:'POST',body:JSON.stringify(body)});
+  const j=await r.json().catch(()=>({}));
+  if(!r.ok){alert(j.error||'Erreur');return null}
+  return j}
+function fbar(){
+  const b=$('#fbar');if(!folder){b.style.display='none';return}
+  b.style.display='flex';
+  b.innerHTML=`<b>📁 ${esc(folder)}</b><button id="frn">✏ Renommer</button><button id="fdel">🗑 Supprimer</button>`;
+  $('#frn').onclick=async()=>{const n=prompt('Nouveau nom du dossier',folder.split('/').pop());if(!n)return;
+    const j=await api('/api/folders/rename',{path:folder,name:n});if(j){folder=j.path;load()}};
+  $('#fdel').onclick=async()=>{if(!confirm('Supprimer le dossier '+folder+' ? (seulement s\'il est vide)'))return;
+    const j=await api('/api/folders/delete',{path:folder});if(j){folder=folder.split('/').slice(0,-1).join('/');load()}};
+}
 async function loadTree(){
   const d=await (await fetch('/api/folders')).json();FOLDERS=d.folders.map(x=>x.path);
   $('#fl').innerHTML=FOLDERS.map(p=>`<option value="${esc(p)}">`).join('');
   const row=(p,label,n,dep)=>`<div class="fi ${p===folder?'on':''}" data-f="${esc(p)}" style="padding-left:${dep*14+8}px">${label} <span class="mut">${n}</span></div>`;
   $('#tree').innerHTML=row('','📚 Tout',d.total,0)+d.folders.map(x=>row(x.path,'📁 '+esc(x.path.split('/').pop()),x.count,x.path.split('/').length)).join('');
+  fbar();
 }
 $('#tree').onclick=e=>{const t=e.target.closest('.fi');if(t){folder=t.dataset.f;load()}};
 $('#nf').onclick=async()=>{const n=prompt('Nom du nouveau dossier'+(folder?' (dans '+folder+')':''));if(!n)return;
@@ -374,12 +444,15 @@ function open(id){
   <div class="f"><b>${esc(cur.name)}</b><span class="mut">${esc(cur.path)} · ${(cur.size/1048576).toFixed(2)} Mo</span>
   <div class="row"><a class="btn" href="${bs}">🖨 Ouvrir dans Bambu Studio</a><a class="btn sec" href="${url}">Télécharger</a></div>
   <label>Tags (séparés par des virgules)<input id="etags" style="width:100%" value="${esc(cur.tags.join(', '))}"></label>
+  <label>Nom du fichier<input id="ename" style="width:100%" value="${esc(cur.name)}"></label>
   <label>Dossier<input id="efolder" list="fl" style="width:100%" value="${esc(cur.folder)}" placeholder="(racine)"></label>
   <label>Description<textarea id="edesc">${esc(cur.description)}</textarea></label>
   <div class="row"><button class="pri" id="save">Enregistrer</button><button id="close">Fermer</button></div></div>`;
   $('#modal').classList.add('on');
   $('#close').onclick=close;
   $('#save').onclick=async()=>{
+    const nn=$('#ename').value.trim();
+    if(nn&&nn!==cur.name){if(!await api('/api/files/'+cur.id+'/rename',{name:nn}))return}
     const nf=$('#efolder').value.trim();
     if(nf!==cur.folder)await fetch('/api/files/'+cur.id+'/move',{method:'POST',body:JSON.stringify({folder:nf})});
     await fetch('/api/files/'+cur.id,{method:'POST',body:JSON.stringify({description:$('#edesc').value,tags:$('#etags').value.split(',')})});

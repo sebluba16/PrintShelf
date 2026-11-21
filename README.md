@@ -34,6 +34,8 @@ Le dossier de stockage est une vraie arborescence de dossiers.
 - Panneau de gauche : navigation par dossier (avec le nombre de fichiers, sous-dossiers inclus).
 - **📁 Nouveau dossier** : crée un dossier dans le dossier courant (`Voitures/F1` crée toute la chaîne).
 - Dans la fiche d'un fichier, le champ **Dossier** permet de le déplacer (les tags et la description suivent).
+- Dossier sélectionné : **✏ Renommer** (les fichiers gardent leurs tags) et **🗑 Supprimer** (uniquement s'il ne contient aucun fichier, pour ne rien perdre par erreur).
+- Dans la fiche, le champ **Nom du fichier** permet de renommer un fichier (`.3mf` ajouté si absent).
 - À l'import, choisis le **dossier de destination** et décide de **garder l'arborescence** du dossier source ou non.
 
 ## Importer depuis plusieurs PC
