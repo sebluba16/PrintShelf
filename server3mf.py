@@ -86,8 +86,36 @@ def scan():
     return len(found)
 
 
+def safe_rel(p):
+    """Chemin relatif de dossier, sûr (pas de .., pas de dossier caché)."""
+    p = (p or "").replace("\\", "/")
+    parts = [x.strip() for x in p.split("/") if x.strip() and x.strip() != "."]
+    if any(x == ".." or x.startswith(".") for x in parts):
+        raise ValueError("chemin invalide")
+    return "/".join(re.sub(r"[^\w.\- ()\[\]]", "_", x) for x in parts)
+
+
+def folder_of(path):
+    return os.path.dirname(path).replace(os.sep, "/")
+
+
+def list_folders(rows):
+    out = []
+    for d, dirs, _ in os.walk(ROOT):
+        dirs[:] = sorted(x for x in dirs if not x.startswith("."))
+        rel = os.path.relpath(d, ROOT)
+        if rel != ".":
+            out.append(rel.replace(os.sep, "/"))
+    res = []
+    for f in sorted(out, key=str.lower):
+        n = sum(1 for r in rows if r["folder"] == f or r["folder"].startswith(f + "/"))
+        res.append({"path": f, "count": n})
+    return {"total": len(rows), "folders": res}
+
+
 def row_json(r):
-    return {"id": r["id"], "name": r["name"], "path": r["path"], "size": r["size"],
+    return {"id": r["id"], "name": r["name"], "path": r["path"], "folder": folder_of(r["path"]),
+            "size": r["size"],
             "description": r["description"],
             "tags": [t for t in r["tags"].split(",") if t],
             "has_thumb": r["thumb"] is not None}
@@ -128,13 +156,20 @@ class H(BaseHTTPRequestHandler):
         if p == "/api/files":
             s = (q.get("q", [""])[0]).lower()
             tag = q.get("tag", [""])[0]
+            fol = q.get("folder", [""])[0].strip("/")
             with db() as c:
                 rows = [row_json(r) for r in c.execute("SELECT * FROM files ORDER BY name COLLATE NOCASE")]
+            if fol:
+                rows = [r for r in rows if r["folder"] == fol or r["folder"].startswith(fol + "/")]
             if s:
                 rows = [r for r in rows if s in (r["name"] + " " + r["description"] + " " + " ".join(r["tags"])).lower()]
             if tag:
                 rows = [r for r in rows if tag in r["tags"]]
             return self.send(200, rows)
+        if p == "/api/folders":
+            with db() as c:
+                rows = [row_json(r) for r in c.execute("SELECT * FROM files")]
+            return self.send(200, list_folders(rows))
         if p == "/api/tags":
             cnt = {}
             with db() as c:
@@ -176,7 +211,11 @@ class H(BaseHTTPRequestHandler):
         if not name.lower().endswith(".3mf"):
             return self.send(400, {"error": "fichier .3mf requis"})
         n = int(self.headers.get("Content-Length", 0))
-        updir = os.path.join(ROOT, "uploads")
+        try:
+            folder = safe_rel(unquote(self.headers.get("X-Folder", "uploads")))
+        except ValueError:
+            return self.send(400, {"error": "dossier invalide"})
+        updir = os.path.join(ROOT, folder)
         os.makedirs(updir, exist_ok=True)
         tmp = os.path.join(updir, ".tmp-" + uuid.uuid4().hex)
         h = hashlib.sha256()
@@ -217,6 +256,39 @@ class H(BaseHTTPRequestHandler):
         data = json.loads(self.rfile.read(n) or b"{}")
         if p == "/api/rescan":
             return self.send(200, {"count": scan()})
+        if p == "/api/folders":
+            try:
+                rel = safe_rel(data.get("path", ""))
+            except ValueError:
+                return self.send(400, {"error": "chemin invalide"})
+            if not rel:
+                return self.send(400, {"error": "nom vide"})
+            os.makedirs(os.path.join(ROOT, rel), exist_ok=True)
+            return self.send(200, {"ok": True, "path": rel})
+        m = re.match(r"^/api/files/(\d+)/move$", p)
+        if m:
+            try:
+                folder = safe_rel(data.get("folder", ""))
+            except ValueError:
+                return self.send(400, {"error": "chemin invalide"})
+            with LOCK, db() as c:
+                r = c.execute("SELECT path,name FROM files WHERE id=?", (m.group(1),)).fetchone()
+                if not r:
+                    return self.send(404, {"error": "introuvable"})
+                src = os.path.join(ROOT, r["path"])
+                os.makedirs(os.path.join(ROOT, folder), exist_ok=True)
+                base, ext = os.path.splitext(r["name"])
+                dest = os.path.join(ROOT, folder, r["name"])
+                if os.path.abspath(dest) == os.path.abspath(src):
+                    return self.send(200, {"ok": True})
+                i = 1
+                while os.path.exists(dest):
+                    dest = os.path.join(ROOT, folder, "%s (%d)%s" % (base, i, ext))
+                    i += 1
+                shutil.move(src, dest)
+                c.execute("UPDATE files SET path=?,name=?,mtime=? WHERE id=?",
+                          (os.path.relpath(dest, ROOT), os.path.basename(dest), os.stat(dest).st_mtime, m.group(1)))
+            return self.send(200, {"ok": True})
         m = re.match(r"^/api/files/(\d+)$", p)
         if m:
             tags = ",".join(clean_tags(data.get("tags", [])))
@@ -258,24 +330,38 @@ textarea{min-height:110px;resize:vertical;width:100%}
 .row{display:flex;gap:8px;flex-wrap:wrap}.mut{color:var(--mut);font-size:13px;word-break:break-all}
 a.btn{display:inline-block;text-decoration:none;background:var(--acc);color:#fff;font-weight:700;padding:10px 14px;border-radius:8px}
 a.btn.sec{background:#2a303a}
+#main{display:flex}aside{width:240px;flex-shrink:0;padding:12px 8px 12px 16px;font-size:14px}
+#main>section{flex:1;min-width:0}
+.fi{padding:5px 8px;border-radius:8px;cursor:pointer}.fi:hover{background:#2a303a}.fi.on{background:var(--acc)}
+@media(max-width:700px){#main{display:block}aside{width:auto}}
 </style></head><body>
 <header><h1>📦 3MF</h1><input id="q" placeholder="Rechercher (nom, tag, description)…">
-<button class="pri" id="imp">⬆ Importer depuis ce PC</button><button id="scan">Réindexer</button><span class="mut" id="cnt"></span></header>
-<div id="tags"></div><div id="grid"></div>
+<button id="nf">📁 Nouveau dossier</button><button class="pri" id="imp">⬆ Importer depuis ce PC</button><button id="scan">Réindexer</button><span class="mut" id="cnt"></span></header>
+<datalist id="fl"></datalist><div id="main"><aside id="tree"></aside><section><div id="tags"></div><div id="grid"></div></section></div>
 <input type="file" id="picker" webkitdirectory multiple hidden>
 <div id="modal"><div class="box" id="box"></div></div>
 <script>
-let files=[],tag="",cur=null;
+let files=[],tag="",cur=null,folder="",FOLDERS=[];
 const $=s=>document.querySelector(s),esc=s=>s.replace(/[&<>"]/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;'}[c]));
 async function load(){
-  const r=await fetch('/api/files?q='+encodeURIComponent($('#q').value)+'&tag='+encodeURIComponent(tag));
+  const r=await fetch('/api/files?q='+encodeURIComponent($('#q').value)+'&tag='+encodeURIComponent(tag)+'&folder='+encodeURIComponent(folder));
   files=await r.json();$('#cnt').textContent=files.length+' fichier(s)';
   $('#grid').innerHTML=files.map(f=>`<div class="card" data-id="${f.id}">
     ${f.has_thumb?`<img loading="lazy" src="/thumb/${f.id}">`:'<div class="noimg">pas d\'image</div>'}
-    <div class="t">${esc(f.name)}</div><div class="tg">${f.tags.map(t=>`<span>${esc(t)}</span>`).join('')}</div></div>`).join('');
+    <div class="t">${esc(f.name)}${f.folder?`<div class="mut">📁 ${esc(f.folder)}</div>`:''}</div><div class="tg">${f.tags.map(t=>`<span>${esc(t)}</span>`).join('')}</div></div>`).join('');
+  await loadTree();
   const tr=await (await fetch('/api/tags')).json();
   $('#tags').innerHTML=tr.map(([t,n])=>`<span class="tag ${t===tag?'on':''}" data-t="${esc(t)}">${esc(t)} (${n})</span>`).join('');
 }
+async function loadTree(){
+  const d=await (await fetch('/api/folders')).json();FOLDERS=d.folders.map(x=>x.path);
+  $('#fl').innerHTML=FOLDERS.map(p=>`<option value="${esc(p)}">`).join('');
+  const row=(p,label,n,dep)=>`<div class="fi ${p===folder?'on':''}" data-f="${esc(p)}" style="padding-left:${dep*14+8}px">${label} <span class="mut">${n}</span></div>`;
+  $('#tree').innerHTML=row('','📚 Tout',d.total,0)+d.folders.map(x=>row(x.path,'📁 '+esc(x.path.split('/').pop()),x.count,x.path.split('/').length)).join('');
+}
+$('#tree').onclick=e=>{const t=e.target.closest('.fi');if(t){folder=t.dataset.f;load()}};
+$('#nf').onclick=async()=>{const n=prompt('Nom du nouveau dossier'+(folder?' (dans '+folder+')':''));if(!n)return;
+  await fetch('/api/folders',{method:'POST',body:JSON.stringify({path:(folder?folder+'/':'')+n})});load()};
 $('#grid').onclick=e=>{const c=e.target.closest('.card');if(c)open(+c.dataset.id)};
 $('#tags').onclick=e=>{const t=e.target.closest('.tag');if(t){tag=tag===t.dataset.t?'':t.dataset.t;load()}};
 $('#q').oninput=()=>load();
@@ -288,11 +374,14 @@ function open(id){
   <div class="f"><b>${esc(cur.name)}</b><span class="mut">${esc(cur.path)} · ${(cur.size/1048576).toFixed(2)} Mo</span>
   <div class="row"><a class="btn" href="${bs}">🖨 Ouvrir dans Bambu Studio</a><a class="btn sec" href="${url}">Télécharger</a></div>
   <label>Tags (séparés par des virgules)<input id="etags" style="width:100%" value="${esc(cur.tags.join(', '))}"></label>
+  <label>Dossier<input id="efolder" list="fl" style="width:100%" value="${esc(cur.folder)}" placeholder="(racine)"></label>
   <label>Description<textarea id="edesc">${esc(cur.description)}</textarea></label>
   <div class="row"><button class="pri" id="save">Enregistrer</button><button id="close">Fermer</button></div></div>`;
   $('#modal').classList.add('on');
   $('#close').onclick=close;
   $('#save').onclick=async()=>{
+    const nf=$('#efolder').value.trim();
+    if(nf!==cur.folder)await fetch('/api/files/'+cur.id+'/move',{method:'POST',body:JSON.stringify({folder:nf})});
     await fetch('/api/files/'+cur.id,{method:'POST',body:JSON.stringify({description:$('#edesc').value,tags:$('#etags').value.split(',')})});
     close();load()};
 }
@@ -303,6 +392,8 @@ $('#picker').onchange=()=>{
     .sort((a,b)=>(a.webkitRelativePath||a.name).localeCompare(b.webkitRelativePath||b.name));
   if(!list.length){alert('Aucun fichier .3mf dans ce dossier.');return}
   $('#box').innerHTML=`<div class="f" style="grid-column:1/-1"><b>Importer ${list.length} fichier(s) 3MF vers la bibliothèque</b>
+   <div class="row" style="align-items:center"><label>Dossier de destination <input id="dest" list="fl" value="${esc(folder)}" placeholder="(racine)"></label>
+   <label><input type="checkbox" id="keep" checked> garder l'arborescence du dossier source</label></div>
    <div class="row"><button id="all">Tout cocher</button><button id="none">Tout décocher</button><span class="mut" id="sel"></span></div>
    <div id="ilist" style="max-height:55vh;overflow:auto;display:flex;flex-direction:column;gap:4px">
    ${list.map((f,i)=>`<label class="row" style="align-items:center;gap:8px"><input type="checkbox" data-i="${i}" checked>
@@ -319,7 +410,9 @@ $('#picker').onchange=()=>{
     $('#go').disabled=true;
     for(const b of boxes().filter(b=>b.checked)){
       const i=+b.dataset.i,st=$('#st'+i);b.disabled=true;st.textContent='⏳';
-      try{const r=await fetch('/api/upload',{method:'POST',headers:{'X-Filename':encodeURIComponent(list[i].name)},body:list[i]});
+      const rp=(list[i].webkitRelativePath||'').split('/');rp.pop();rp.shift();
+      const target=[$('#dest').value.trim(),$('#keep').checked?rp.join('/'):''].filter(Boolean).join('/');
+      try{const r=await fetch('/api/upload',{method:'POST',headers:{'X-Filename':encodeURIComponent(list[i].name),'X-Folder':encodeURIComponent(target)},body:list[i]});
         const j=await r.json();st.textContent=j.status==='added'?'✅ ajouté':j.status==='duplicate'?'↩ déjà présent':'❌ '+(j.error||'erreur')}
       catch(e){st.textContent='❌ réseau'}
     }

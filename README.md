@@ -27,6 +27,15 @@ Options :
 
 Les tags et descriptions sont stockés dans `<dossier>/.library.db`. Le bouton **Réindexer** prend en compte les nouveaux fichiers, sans perdre les tags existants.
 
+## Arborescence
+
+Le dossier de stockage est une vraie arborescence de dossiers.
+
+- Panneau de gauche : navigation par dossier (avec le nombre de fichiers, sous-dossiers inclus).
+- **📁 Nouveau dossier** : crée un dossier dans le dossier courant (`Voitures/F1` crée toute la chaîne).
+- Dans la fiche d'un fichier, le champ **Dossier** permet de le déplacer (les tags et la description suivent).
+- À l'import, choisis le **dossier de destination** et décide de **garder l'arborescence** du dossier source ou non.
+
 ## Importer depuis plusieurs PC
 
 Un seul serveur = un seul dépôt. Depuis **n'importe quel PC** :
@@ -35,7 +44,7 @@ Un seul serveur = un seul dépôt. Depuis **n'importe quel PC** :
 2. Clique sur **⬆ Importer depuis ce PC** et choisis le dossier local contenant des 3MF.
 3. Coche les fichiers à transférer (ou tout cocher / tout décocher), puis **Transférer la sélection**.
 
-Les fichiers arrivent dans `<dossier>/uploads/`. Les doublons (même contenu, même nom ou non) sont détectés et ignorés ; un nom déjà pris reçoit un suffixe `(1)`.
+Les fichiers arrivent dans le dossier de destination choisi. Les doublons (même contenu, même nom ou non) sont détectés et ignorés ; un nom déjà pris reçoit un suffixe `(1)`.
 
 ## Ouvrir dans Bambu Studio
 
