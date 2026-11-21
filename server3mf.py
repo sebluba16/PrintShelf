@@ -6,12 +6,17 @@ Sans dépendance externe (stdlib uniquement).
 """
 import argparse, hashlib, json, os, re, shutil, sqlite3, threading, uuid, zipfile
 from http.server import ThreadingHTTPServer, BaseHTTPRequestHandler
-from urllib.parse import urlparse, parse_qs, unquote
+from urllib.parse import urlparse, parse_qs, unquote, quote
 
 THUMBS = ["Metadata/plate_1.png", "Metadata/thumbnail.png", "Metadata/top_1.png",
           "Metadata/plate_no_light_1.png", "Metadata/pick_1.png",
           "Thumbnails/thumbnail.png", "/Metadata/plate_1.png"]
 LOCK = threading.Lock()
+MAX_UPLOAD = 2048 << 20      # taille max d'un fichier envoyé (option --max-mb)
+MAX_JSON = 1 << 20           # taille max d'un corps JSON
+MAX_THUMB = 20 << 20         # taille max d'une miniature lue dans un 3MF (anti zip-bomb)
+CSP = ("default-src 'none'; script-src 'unsafe-inline'; style-src 'unsafe-inline'; "
+       "img-src 'self'; connect-src 'self'; frame-ancestors 'none'; base-uri 'none'; form-action 'none'")
 ROOT = "."
 DB = None
 
@@ -42,16 +47,25 @@ def sha256_file(path):
     return h.hexdigest()
 
 
+def inside_root(path):
+    root = os.path.realpath(ROOT)
+    return os.path.realpath(path).startswith(root + os.sep)
+
+
+def read_small(z, name):
+    return z.read(name) if z.getinfo(name).file_size <= MAX_THUMB else None
+
+
 def extract_thumb(path):
     try:
         with zipfile.ZipFile(path) as z:
             names = set(z.namelist())
             for t in THUMBS:
                 if t in names:
-                    return z.read(t)
+                    return read_small(z, t)
             pngs = sorted(n for n in names if n.lower().endswith(".png"))
             if pngs:
-                return z.read(pngs[0])
+                return read_small(z, pngs[0])
     except Exception:
         pass
     return None
@@ -66,6 +80,8 @@ def scan():
                 if not f.lower().endswith(".3mf"):
                     continue
                 full = os.path.join(d, f)
+                if not inside_root(full):  # lien symbolique vers l'extérieur
+                    continue
                 rel = os.path.relpath(full, ROOT)
                 found.add(rel)
                 st = os.stat(full)
@@ -142,6 +158,9 @@ class H(BaseHTTPRequestHandler):
         self.send_response(code)
         self.send_header("Content-Type", ctype)
         self.send_header("Content-Length", str(len(body)))
+        self.send_header("X-Content-Type-Options", "nosniff")
+        self.send_header("X-Frame-Options", "DENY")
+        self.send_header("Content-Security-Policy", CSP)
         for k, v in (extra or {}).items():
             self.send_header(k, v)
         self.end_headers()
@@ -192,11 +211,14 @@ class H(BaseHTTPRequestHandler):
             if not r:
                 return self.send(404, "not found", "text/plain")
             full = os.path.join(ROOT, r["path"])
+            if not inside_root(full) or not os.path.isfile(full):
+                return self.send(404, "not found", "text/plain")
             size = os.path.getsize(full)
             self.send_response(200)
             self.send_header("Content-Type", "model/3mf")
+            self.send_header("X-Content-Type-Options", "nosniff")
             self.send_header("Content-Length", str(size))
-            self.send_header("Content-Disposition", 'attachment; filename="%s"' % os.path.basename(full))
+            self.send_header("Content-Disposition", "attachment; filename*=UTF-8''" + quote(os.path.basename(full)))
             self.end_headers()
             with open(full, "rb") as f:
                 while chunk := f.read(1 << 16):
@@ -204,13 +226,27 @@ class H(BaseHTTPRequestHandler):
             return
         self.send(404, "not found", "text/plain")
 
+    def csrf_ok(self):
+        """Anti-CSRF : en-tête personnalisé (impose un preflight CORS, jamais accepté) + Origin identique."""
+        if self.headers.get("X-Requested-With") != "PrintShelf":
+            return False
+        origin = self.headers.get("Origin")
+        return not origin or urlparse(origin).netloc == self.headers.get("Host")
+
     def upload(self):
         """POST /api/upload : corps = fichier brut, nom dans l'en-tête X-Filename."""
         name = os.path.basename(unquote(self.headers.get("X-Filename", "")).replace("\\", "/"))
         name = re.sub(r"[^\w.\- ()\[\]]", "_", name).strip()
         if not name.lower().endswith(".3mf"):
             return self.send(400, {"error": "fichier .3mf requis"})
-        n = int(self.headers.get("Content-Length", 0))
+        try:
+            n = int(self.headers.get("Content-Length", 0))
+        except ValueError:
+            n = -1
+        if n <= 0:
+            return self.send(400, {"error": "corps vide"})
+        if n > MAX_UPLOAD:
+            return self.send(413, {"error": "fichier trop gros"})
         try:
             folder = safe_rel(unquote(self.headers.get("X-Folder", "uploads")))
         except ValueError:
@@ -250,10 +286,19 @@ class H(BaseHTTPRequestHandler):
 
     def do_POST(self):
         p = urlparse(self.path).path
+        if not self.csrf_ok():
+            return self.send(403, {"error": "requête refusée"})
         if p == "/api/upload":
             return self.upload()
-        n = int(self.headers.get("Content-Length", 0))
-        data = json.loads(self.rfile.read(n) or b"{}")
+        try:
+            n = int(self.headers.get("Content-Length", 0))
+            if not 0 <= n <= MAX_JSON:
+                raise ValueError
+            data = json.loads(self.rfile.read(n) or b"{}")
+            if not isinstance(data, dict):
+                raise ValueError
+        except ValueError:
+            return self.send(400, {"error": "requête invalide"})
         if p == "/api/rescan":
             return self.send(200, {"count": scan()})
         if p == "/api/folders":
@@ -297,6 +342,19 @@ class H(BaseHTTPRequestHandler):
             if any(fs for _, _, fs in os.walk(target)):
                 return self.send(409, {"error": "dossier non vide : déplace d'abord ses fichiers"})
             shutil.rmtree(target)
+            return self.send(200, {"ok": True})
+        m = re.match(r"^/api/files/(\d+)/delete$", p)
+        if m:
+            with LOCK, db() as c:
+                r = c.execute("SELECT path FROM files WHERE id=?", (m.group(1),)).fetchone()
+                if not r:
+                    return self.send(404, {"error": "introuvable"})
+                full = os.path.join(ROOT, r["path"])
+                if not inside_root(full):
+                    return self.send(400, {"error": "chemin invalide"})
+                if os.path.isfile(full):
+                    os.remove(full)
+                c.execute("DELETE FROM files WHERE id=?", (m.group(1),))
             return self.send(200, {"ok": True})
         m = re.match(r"^/api/files/(\d+)/rename$", p)
         if m:
@@ -396,6 +454,8 @@ a.btn.sec{background:#2a303a}
 <input type="file" id="picker" webkitdirectory multiple hidden>
 <div id="modal"><div class="box" id="box"></div></div>
 <script>
+const _f=window.fetch.bind(window);
+window.fetch=(u,o={})=>_f(u,{...o,headers:{...(o.headers||{}),'X-Requested-With':'PrintShelf'}});
 let files=[],tag="",cur=null,folder="",FOLDERS=[];
 const $=s=>document.querySelector(s),esc=s=>s.replace(/[&<>"]/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;'}[c]));
 async function load(){
@@ -447,9 +507,11 @@ function open(id){
   <label>Nom du fichier<input id="ename" style="width:100%" value="${esc(cur.name)}"></label>
   <label>Dossier<input id="efolder" list="fl" style="width:100%" value="${esc(cur.folder)}" placeholder="(racine)"></label>
   <label>Description<textarea id="edesc">${esc(cur.description)}</textarea></label>
-  <div class="row"><button class="pri" id="save">Enregistrer</button><button id="close">Fermer</button></div></div>`;
+  <div class="row"><button class="pri" id="save">Enregistrer</button><button id="close">Fermer</button><button id="del" style="margin-left:auto">🗑 Supprimer</button></div></div>`;
   $('#modal').classList.add('on');
   $('#close').onclick=close;
+  $('#del').onclick=async()=>{if(!confirm('Supprimer définitivement "'+cur.name+'" du dépôt ?'))return;
+    if(await api('/api/files/'+cur.id+'/delete',{})){close();load()}};
   $('#save').onclick=async()=>{
     const nn=$('#ename').value.trim();
     if(nn&&nn!==cur.name){if(!await api('/api/files/'+cur.id+'/rename',{name:nn}))return}
@@ -504,7 +566,10 @@ def main():
     ap.add_argument("root", nargs="?", default=os.environ.get("MF_ROOT", "./3mf"))
     ap.add_argument("--host", default="0.0.0.0")
     ap.add_argument("--port", type=int, default=8000)
+    ap.add_argument("--max-mb", type=int, default=2048, help="taille max d'un fichier importé (Mo)")
     a = ap.parse_args()
+    global MAX_UPLOAD
+    MAX_UPLOAD = a.max_mb << 20
     ROOT = os.path.abspath(a.root)
     os.makedirs(ROOT, exist_ok=True)
     DB = os.path.join(ROOT, ".library.db")

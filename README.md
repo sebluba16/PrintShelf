@@ -59,9 +59,19 @@ Le bouton utilise le lien `bambustudio://open?file=<url>` : Bambu Studio téléc
 
 Lues dans le 3MF, par ordre de préférence : `Metadata/plate_1.png`, `Metadata/thumbnail.png`, `Metadata/top_1.png`, puis le premier PNG trouvé.
 
+## Supprimer un fichier
+
+Dans la fiche : **🗑 Supprimer** (avec confirmation). Le fichier est effacé du disque et de l'index. C'est définitif.
+
 ## Sécurité
 
-Aucune authentification : à utiliser sur un réseau de confiance, ou derrière un reverse proxy authentifié.
+Protections en place :
+- **Anti-CSRF** : toute modification exige l'en-tête `X-Requested-With: PrintShelf` (donc une requête « preflight » qu'un autre site ne peut pas obtenir) et un `Origin` identique au serveur. Un site malveillant ouvert dans ton navigateur ne peut pas supprimer ou envoyer de fichiers.
+- **Chemins** : dossiers et noms nettoyés, `..` et dossiers cachés refusés, fichiers hors du dossier de stockage (liens symboliques) ignorés.
+- **Limites** : taille max d'import (`--max-mb`, 2048 par défaut), corps JSON limité, miniature limitée à 20 Mo (anti zip-bomb), import refusé si ce n'est pas un vrai zip.
+- **Navigateur** : en-têtes `Content-Security-Policy`, `X-Frame-Options: DENY`, `nosniff` ; tout le contenu affiché est échappé (anti-XSS) ; requêtes SQL paramétrées.
+
+À savoir : **il n'y a pas d'authentification**. Toute personne qui atteint le serveur peut lire, importer et supprimer. Utilise-le sur un réseau de confiance (maison), ou derrière un reverse proxy avec mot de passe / VPN (Tailscale, WireGuard). Ne l'expose pas sur Internet tel quel.
 
 ## Licence
 
