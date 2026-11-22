@@ -46,7 +46,9 @@ Un seul serveur = un seul dépôt. Depuis **n'importe quel PC** :
 2. Clique sur **⬆ Importer depuis ce PC** et choisis le dossier local contenant des 3MF.
 3. Coche les fichiers à transférer (ou tout cocher / tout décocher), puis **Transférer la sélection**.
 
-Les fichiers arrivent dans le dossier de destination choisi. Les doublons (même contenu, même nom ou non) sont détectés et ignorés ; un nom déjà pris reçoit un suffixe `(1)`.
+Les fichiers arrivent dans le dossier de destination choisi.
+
+**⚡ Tout importer** envoie d'un seul clic tous les `.3mf` du dossier choisi (sous-dossiers compris, y compris les `.gcode.3mf` de Bambu Studio), 3 à la fois, avec une barre de progression et un bilan. Si un fichier échoue, la raison s'affiche sur sa ligne et il peut être renvoyé. Si le dossier ne contient aucun `.3mf`, un message indique les extensions trouvées. Les doublons (même contenu, même nom ou non) sont détectés et ignorés ; un nom déjà pris reçoit un suffixe `(1)`.
 
 ## Ouvrir dans Bambu Studio
 

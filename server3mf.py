@@ -285,7 +285,7 @@ class H(BaseHTTPRequestHandler):
         p = u.path
         q = parse_qs(u.query)
         if p == "/":
-            return self.send(200, PAGE, "text/html; charset=utf-8")
+            return self.send(200, PAGE, "text/html; charset=utf-8", {"Cache-Control": "no-store"})
         if p == "/api/files":
             s = (q.get("q", [""])[0]).lower()
             tag = q.get("tag", [""])[0]
@@ -720,36 +720,55 @@ function open(id){
 function close(){$('#modal').classList.remove('on')}
 $('#imp').onclick=()=>{$('#picker').value='';$('#picker').click()};
 $('#picker').onchange=()=>{
-  const list=[...$('#picker').files].filter(f=>f.name.toLowerCase().endsWith('.3mf'))
+  const all=[...$('#picker').files];if(!all.length)return;
+  const list=all.filter(f=>f.name.toLowerCase().endsWith('.3mf'))
     .sort((a,b)=>(a.webkitRelativePath||a.name).localeCompare(b.webkitRelativePath||b.name));
-  if(!list.length){alert('Aucun fichier .3mf dans ce dossier.');return}
-  $('#box').innerHTML=`<div class="f" style="grid-column:1/-1"><b>Importer ${list.length} fichier(s) 3MF vers la bibliothèque</b>
+  if(!list.length){
+    const ext={};all.forEach(f=>{const m=f.name.match(/[.][^.]+$/);const e=m?m[0].toLowerCase():'(sans extension)';ext[e]=(ext[e]||0)+1});
+    alert('Aucun fichier .3mf trouvé parmi '+all.length+' fichier(s) du dossier.\nExtensions vues : '+Object.entries(ext).map(([e,n])=>e+' x'+n).join(', '));return}
+  $('#box').innerHTML=`<div class="f" style="grid-column:1/-1"><b>${list.length} fichier(s) 3MF trouvé(s)${all.length>list.length?' ('+(all.length-list.length)+' autre(s) fichier(s) ignoré(s))':''}</b>
    <div class="row" style="align-items:center"><label>Dossier de destination <input id="dest" list="fl" value="${esc(folder)}" placeholder="(racine)"></label>
    <label><input type="checkbox" id="keep" checked> garder l'arborescence du dossier source</label></div>
-   <div class="row"><button id="all">Tout cocher</button><button id="none">Tout décocher</button><span class="mut" id="sel"></span></div>
-   <div id="ilist" style="max-height:55vh;overflow:auto;display:flex;flex-direction:column;gap:4px">
+   <div class="row" style="align-items:center"><button class="pri" id="goall">⚡ Tout importer (${list.length})</button>
+   <button id="all">Tout cocher</button><button id="none">Tout décocher</button><span class="mut" id="sel"></span></div>
+   <progress id="prog" value="0" max="1" style="width:100%;display:none"></progress>
+   <div id="ilist" style="max-height:45vh;overflow:auto;display:flex;flex-direction:column;gap:4px">
    ${list.map((f,i)=>`<label class="row" style="align-items:center;gap:8px"><input type="checkbox" data-i="${i}" checked>
      <span style="flex:1;word-break:break-all">${esc(f.webkitRelativePath||f.name)}</span>
      <span class="mut">${(f.size/1048576).toFixed(1)} Mo</span><span class="mut" id="st${i}"></span></label>`).join('')}</div>
-   <div class="row"><button class="pri" id="go">Transférer la sélection</button><button id="close">Fermer</button></div></div>`;
+   <div class="row" style="align-items:center"><button class="pri" id="go">Transférer la sélection</button><button id="close">Fermer</button><span class="mut" id="sum"></span></div></div>`;
   $('#modal').classList.add('on');$('#close').onclick=()=>{close();load()};
   const boxes=()=>[...document.querySelectorAll('#ilist input')];
-  const upd=()=>$('#sel').textContent=boxes().filter(b=>b.checked).length+' sélectionné(s)';
+  const upd=()=>$('#sel').textContent=boxes().filter(b=>b.checked&&!b.disabled).length+' sélectionné(s)';
   $('#ilist').onchange=upd;upd();
-  $('#all').onclick=()=>{boxes().forEach(b=>b.checked=true);upd()};
+  $('#all').onclick=()=>{boxes().forEach(b=>{if(!b.disabled)b.checked=true});upd()};
   $('#none').onclick=()=>{boxes().forEach(b=>b.checked=false);upd()};
-  $('#go').onclick=async()=>{
-    $('#go').disabled=true;
-    for(const b of boxes().filter(b=>b.checked)){
-      const i=+b.dataset.i,st=$('#st'+i);b.disabled=true;st.textContent='⏳';
-      const rp=(list[i].webkitRelativePath||'').split('/');rp.pop();rp.shift();
-      const target=[$('#dest').value.trim(),$('#keep').checked?rp.join('/'):''].filter(Boolean).join('/');
-      try{const r=await fetch('/api/upload',{method:'POST',headers:{'X-Filename':encodeURIComponent(list[i].name),'X-Folder':encodeURIComponent(target)},body:list[i]});
-        const j=await r.json();st.textContent=j.status==='added'?'✅ ajouté':j.status==='duplicate'?'↩ déjà présent':'❌ '+(j.error||'erreur')}
-      catch(e){st.textContent='❌ réseau'}
-    }
-    $('#go').textContent='Terminé';
+  const run=async(items)=>{
+    if(!items.length)return;
+    const dest=$('#dest').value.trim(),keep=$('#keep').checked;
+    $('#go').disabled=$('#goall').disabled=true;
+    const pr=$('#prog');pr.style.display='block';pr.max=items.length;pr.value=0;
+    const cnt={added:0,dup:0,err:0};let idx=0;
+    const worker=async()=>{while(idx<items.length){
+      const i=items[idx++],b=document.querySelector('#ilist input[data-i="'+i+'"]'),st=$('#st'+i),f=list[i];
+      b.disabled=true;st.textContent='⏳';
+      const rp=(f.webkitRelativePath||'').split('/');rp.pop();rp.shift();
+      const target=[dest,keep?rp.join('/'):''].filter(Boolean).join('/');
+      try{
+        const r=await fetch('/api/upload',{method:'POST',headers:{'X-Filename':encodeURIComponent(f.name),'X-Folder':encodeURIComponent(target)},body:f});
+        const j=await r.json().catch(()=>({}));
+        if(r.ok&&j.status==='added'){st.textContent='✅ ajouté';cnt.added++}
+        else if(r.ok&&j.status==='duplicate'){st.textContent='↩ déjà présent';cnt.dup++}
+        else{st.textContent='❌ '+(j.error||'erreur '+r.status)+(r.status===403?' (recharge la page : Ctrl+F5)':'');cnt.err++;b.disabled=false;b.checked=true}
+      }catch(e){st.textContent='❌ lecture impossible (fichier verrouillé ou réseau coupé ?)';cnt.err++;b.disabled=false;b.checked=true}
+      pr.value++;$('#sum').textContent=pr.value+' / '+items.length;
+    }};
+    await Promise.all([worker(),worker(),worker()]);
+    $('#sum').textContent='Terminé : '+cnt.added+' ajouté(s), '+cnt.dup+' déjà présent(s), '+cnt.err+' erreur(s)';
+    $('#go').disabled=$('#goall').disabled=false;upd();load();
   };
+  $('#go').onclick=()=>run(boxes().filter(b=>b.checked&&!b.disabled).map(b=>+b.dataset.i));
+  $('#goall').onclick=()=>{boxes().forEach(b=>{if(!b.disabled)b.checked=true});run(boxes().filter(b=>!b.disabled).map(b=>+b.dataset.i))};
 };
 $('#modal').onclick=e=>{if(e.target.id==='modal')close()};
 document.onkeydown=e=>{if(e.key==='Escape')close()};
